@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         LeetCodeRating｜显示力扣周赛难度分
 // @namespace    https://github.com/zhang-wangz
-// @version      3.1.5
+// @version      3.1.6
 // @license      MIT
 // @description  LeetCodeRating 力扣周赛分数显现和相关力扣小功能，目前浏览器更新规则，使用该插件前请手动打开浏览器开发者模式再食用～
 // @author       小东是个阳光蛋(力扣名)
@@ -34,7 +34,7 @@
   function userScript() {
     'use strict';
 
-    const version = '3.1.5';
+    const version = '3.1.6';
     let pbstatusVersion = 'version24';
     let t2rateVersion = 'Version15';
     let levelVersion = 'Version29';
@@ -604,6 +604,7 @@
             true,
             true
           ],
+          ['switchtodaycount', 'todaycount function', '页面显示今日完成题数（北京时间）', false, true],
           ['switchperson', 'person function', '纸片人', false, true]
         ],
         menu_ID = [],
@@ -2629,8 +2630,287 @@
         }
       });
     }
+    // 可选的今日完成题数浮窗；来源是当前登录账号的力扣提交记录。
+    function initTodayCount() {
+      'use strict';
+
+      if (window.top !== window.self || document.getElementById('lc-today-count')) return;
+
+      const TIME_ZONE = 'Asia/Shanghai';
+      const REFRESH_MS = 5 * 60 * 1000;
+      const PAGE_SIZE = 20;
+      const MAX_PAGES = 100;
+      const PROFILE_PAGE_SIZE = 50;
+      let loading = false;
+      let renderedDay = '';
+      let signedInUser = '';
+      let restBlockedUntil = 0;
+
+      const panel = document.createElement('div');
+      panel.id = 'lc-today-count';
+      panel.setAttribute('role', 'status');
+      panel.style.cssText = [
+        'position:fixed', 'bottom:80px', 'right:18px', 'z-index:2147483646',
+        'display:flex', 'align-items:center', 'gap:9px', 'padding:9px 11px',
+        'border:1px solid rgba(128,128,128,.25)', 'border-radius:12px',
+        'background:rgba(255,255,255,.96)', 'color:#24292f',
+        'box-shadow:0 3px 14px rgba(0,0,0,.13)',
+        'font:13px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif',
+        'max-width:min(230px, calc(100vw - 16px))', 'box-sizing:border-box',
+        'cursor:move', 'user-select:none'
+      ].join(';');
+
+      const label = document.createElement('span');
+      label.textContent = '今日完成 · 统计中…';
+      const refreshButton = document.createElement('button');
+      refreshButton.type = 'button';
+      refreshButton.textContent = '↻';
+      refreshButton.title = '重新统计今日完成题数';
+      refreshButton.setAttribute('aria-label', '重新统计今日完成题数');
+      refreshButton.style.cssText = 'border:0;background:transparent;color:inherit;cursor:pointer;font-size:17px;line-height:1;padding:0 2px';
+      panel.append(label, refreshButton);
+      (document.body || document.documentElement).appendChild(panel);
+
+      const darkMode = window.matchMedia('(prefers-color-scheme: dark)');
+      function applyTheme() {
+        panel.style.background = darkMode.matches ? 'rgba(35,39,45,.96)' : 'rgba(255,255,255,.96)';
+        panel.style.color = darkMode.matches ? '#f0f2f4' : '#24292f';
+      }
+      darkMode.addEventListener('change', applyTheme);
+      applyTheme();
+
+      let drag = null;
+      panel.addEventListener('pointerdown', (event) => {
+        if (event.target === refreshButton) return;
+        const rect = panel.getBoundingClientRect();
+        drag = { x: event.clientX - rect.left, y: event.clientY - rect.top };
+        panel.setPointerCapture(event.pointerId);
+      });
+      panel.addEventListener('pointermove', (event) => {
+        if (!drag) return;
+        panel.style.right = 'auto';
+        panel.style.bottom = 'auto';
+        panel.style.left = `${Math.max(0, Math.min(innerWidth - panel.offsetWidth, event.clientX - drag.x))}px`;
+        panel.style.top = `${Math.max(0, Math.min(innerHeight - panel.offsetHeight, event.clientY - drag.y))}px`;
+      });
+      panel.addEventListener('pointerup', () => { drag = null; });
+      panel.addEventListener('pointercancel', () => { drag = null; });
+
+      // 用户拖动后 left/top 是固定像素；窗口缩窄、分屏或缩放时将它拉回可见区域。
+      function keepVisible() {
+        const viewport = window.visualViewport;
+        const width = viewport ? viewport.width : innerWidth;
+        const height = viewport ? viewport.height : innerHeight;
+        const originX = viewport ? viewport.offsetLeft : 0;
+        const originY = viewport ? viewport.offsetTop : 0;
+        if (panel.style.left) {
+          const left = parseFloat(panel.style.left) || 0;
+          panel.style.left = `${Math.max(originX + 8, Math.min(left, originX + width - panel.offsetWidth - 8))}px`;
+        }
+        if (panel.style.top) {
+          const top = parseFloat(panel.style.top) || 0;
+          panel.style.top = `${Math.max(originY + 8, Math.min(top, originY + height - panel.offsetHeight - 8))}px`;
+        }
+      }
+      window.addEventListener('resize', keepVisible);
+      window.visualViewport?.addEventListener('resize', keepVisible);
+      window.visualViewport?.addEventListener('scroll', keepVisible);
+
+      function todayKey() {
+        return new Intl.DateTimeFormat('en-CA', {
+          timeZone: TIME_ZONE, year: 'numeric', month: '2-digit', day: '2-digit'
+        }).format(new Date());
+      }
+
+      function setDisplay(message, detail) {
+        label.textContent = message;
+        panel.title = detail || '按北京时间 00:00—24:00，重复通过同一题只计一次。';
+      }
+
+      async function graphQL(operationName, query, variables = {}) {
+        const response = await fetch('/graphql/', {
+          method: 'POST', credentials: 'same-origin',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ operationName, variables, query })
+        });
+        if (!response.ok) {
+          const detail = (await response.text()).slice(0, 220).replace(/\s+/g, ' ');
+          throw new Error(`力扣接口读取失败：HTTP ${response.status} ${detail}`);
+        }
+        const result = await response.json();
+        if (result.errors?.length) throw new Error(result.errors[0].message);
+        return result.data;
+      }
+
+      async function signedIn() {
+        const data = await graphQL('globalData',
+          'query globalData { userStatus { isSignedIn username } }');
+        signedInUser = data?.userStatus?.username || '';
+        return data?.userStatus?.isSignedIn === true;
+      }
+
+      async function countToday() {
+        const day = todayKey();
+        const startSeconds = Date.parse(`${day}T00:00:00+08:00`) / 1000;
+        const nextSeconds = startSeconds + 24 * 60 * 60;
+        const solved = new Set();
+        let offset = 0;
+        let lastKey = '';
+
+        for (let page = 0; page < MAX_PAGES; page++) {
+          const query = new URLSearchParams({ offset: String(offset), limit: String(PAGE_SIZE) });
+          if (lastKey) query.set('last_key', lastKey);
+          const response = await fetch(`/api/submissions/?${query}`, {
+            credentials: 'same-origin'
+          });
+          if (!response.ok) throw new Error(`提交记录读取失败：HTTP ${response.status}`);
+          const result = await response.json();
+          const submissions = result.submissions_dump;
+          if (!Array.isArray(submissions)) throw new Error('提交记录格式已变化');
+
+          let reachedYesterday = false;
+          for (const item of submissions) {
+            const rawTime = Number(item.timestamp);
+            const seconds = rawTime > 1e12 ? rawTime / 1000 : rawTime;
+            if (!Number.isFinite(seconds)) throw new Error('提交时间格式已变化');
+            if (seconds < startSeconds) { reachedYesterday = true; continue; }
+            if (seconds >= nextSeconds) continue;
+
+            const accepted = item.status_display === 'Accepted' ||
+              item.status_display === '通过' || item.status === 'AC' || item.status === 10;
+            if (!accepted) continue;
+            const question = item.title_slug || item.titleSlug || item.question_id || item.questionId || item.title;
+            if (!question) throw new Error('提交记录缺少题目标识');
+            solved.add(String(question));
+          }
+
+          if (reachedYesterday || result.has_next === false || submissions.length === 0) {
+            return { count: solved.size, day, complete: true, source: '提交记录' };
+          }
+          offset += submissions.length;
+          lastKey = result.last_key || '';
+        }
+        throw new Error('今日提交过多，尚未读取完整记录');
+      }
+
+      async function countFromProfile() {
+        const day = todayKey();
+        const startSeconds = Date.parse(`${day}T00:00:00+08:00`) / 1000;
+        const nextSeconds = startSeconds + 24 * 60 * 60;
+        const solved = new Set();
+        for (let profilePage = 0; profilePage < MAX_PAGES; profilePage++) {
+          const data = await graphQL('todayCandidates',
+            'query todayCandidates($skip: Int!, $first: Int!) { userProfileQuestions(status: ACCEPTED, skip: $skip, first: $first, sortField: LAST_SUBMITTED_AT, sortOrder: DESCENDING) { questions { titleSlug lastSubmittedAt } } }',
+            { skip: profilePage * PROFILE_PAGE_SIZE, first: PROFILE_PAGE_SIZE });
+          const questions = data?.userProfileQuestions?.questions;
+          if (!Array.isArray(questions)) throw new Error('已通过题目列表格式已变化');
+          for (const question of questions) {
+            const lastTime = Number(question.lastSubmittedAt);
+            if (!Number.isFinite(lastTime)) throw new Error('题目最近提交时间格式已变化');
+            if (lastTime < startSeconds) {
+              return { count: solved.size, day, complete: true, source: '题目提交记录' };
+            }
+            if (lastTime >= nextSeconds) continue;
+            if (!question.titleSlug) throw new Error('已通过题目缺少标识');
+            let lastKey = null;
+            let offset = 0;
+            for (let page = 0; page < MAX_PAGES; page++) {
+              const detail = await graphQL('questionSubmissions',
+                'query questionSubmissions($offset: Int!, $limit: Int!, $lastKey: String, $questionSlug: String!) { submissionList(offset: $offset, limit: $limit, lastKey: $lastKey, questionSlug: $questionSlug) { lastKey hasNext submissions { statusDisplay timestamp } } }',
+                { offset, limit: PAGE_SIZE, lastKey, questionSlug: question.titleSlug });
+              const list = detail?.submissionList?.submissions;
+              if (!Array.isArray(list)) throw new Error('单题提交记录格式已变化');
+              let reachedYesterday = false;
+              for (const item of list) {
+                const seconds = Number(item.timestamp);
+                if (!Number.isFinite(seconds)) throw new Error('单题提交时间格式已变化');
+                if (seconds < startSeconds) { reachedYesterday = true; continue; }
+                if (seconds < nextSeconds && (item.statusDisplay === 'Accepted' || item.statusDisplay === '通过')) {
+                  solved.add(question.titleSlug);
+                }
+              }
+              if (solved.has(question.titleSlug) || reachedYesterday || !detail.submissionList.hasNext || !list.length) break;
+              offset += list.length;
+              lastKey = detail.submissionList.lastKey || null;
+              if (page === MAX_PAGES - 1) throw new Error('单题提交过多，尚未读取完整记录');
+            }
+          }
+          if (questions.length < PROFILE_PAGE_SIZE) {
+            return { count: solved.size, day, complete: true, source: '题目提交记录' };
+          }
+        }
+        throw new Error('今日题目过多，尚未读取完整记录');
+      }
+
+      function cacheKey() { return `lc-today-count:${signedInUser}:${todayKey()}`; }
+      function readCache() {
+        try { return JSON.parse(localStorage.getItem(cacheKey()) || 'null'); }
+        catch { return null; }
+      }
+      function writeCache(result) {
+        try { localStorage.setItem(cacheKey(), JSON.stringify({ ...result, savedAt: Date.now() })); }
+        catch { /* 浏览器可能禁用本地存储；不影响本次统计。 */ }
+      }
+
+      async function refresh() {
+        if (loading) return;
+        loading = true;
+        refreshButton.disabled = true;
+        setDisplay('今日完成 · 统计中…');
+        try {
+          if (!(await signedIn())) {
+            setDisplay('今日完成 · 请先登录力扣');
+            return;
+          }
+          let result;
+          try {
+            if (Date.now() < restBlockedUntil) throw new Error('提交记录接口暂不可用');
+            result = await countToday();
+          } catch (primaryError) {
+            if (/HTTP 403/.test(primaryError.message)) restBlockedUntil = Date.now() + 15 * 60 * 1000;
+            try {
+              result = await countFromProfile();
+            } catch (fallbackError) {
+              throw new Error(`${primaryError.message}；备用接口：${fallbackError.message}`);
+            }
+          }
+          // 统计期间若跨过午夜，直接重新读取新一天的数据。
+          if (result.day !== todayKey()) {
+            setTimeout(refresh, 0);
+            return;
+          }
+          renderedDay = result.day;
+          writeCache(result);
+          setDisplay(`今日完成 · ${result.complete ? '' : '至少 '}${result.count} 题`,
+            `${result.day}（北京时间），当天至少通过一次的不同题目。来源：${result.source}${result.complete ? '' : '，近期记录未覆盖全天'}；点击 ↻ 更新。`);
+        } catch (error) {
+          const cached = signedInUser && readCache();
+          if (cached && Number.isInteger(cached.count)) {
+            setDisplay(`今日完成 · ${cached.complete ? '' : '至少 '}${cached.count} 题（待更新）`,
+              `上次更新：${new Date(cached.savedAt).toLocaleTimeString('zh-CN')}；本次读取失败：${error.message || error}。点击 ↻ 重试。`);
+          } else {
+            setDisplay('今日完成 · 读取失败', `${error.message || error}；点击 ↻ 重试。`);
+          }
+        } finally {
+          loading = false;
+          refreshButton.disabled = false;
+        }
+      }
+
+      refreshButton.addEventListener('click', refresh);
+      window.addEventListener('focus', () => {
+        if (renderedDay !== todayKey()) refresh();
+      });
+      document.addEventListener('visibilitychange', () => {
+        if (!document.hidden) refresh();
+      });
+      setInterval(() => { if (!document.hidden) refresh(); }, REFRESH_MS);
+      refresh();
+    }
+
     // 获取必须获取的数据
     getNeedData();
+    if (GM_getValue('switchtodaycount')) initTodayCount();
 
     // 如果pbstatus数据开关已打开且需要更新
     if (GM_getValue('switchpbstatus')) {
